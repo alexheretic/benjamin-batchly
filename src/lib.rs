@@ -1,8 +1,8 @@
 //! Low latency batching tool.
 //! Bundle lots of single concurrent operations into sequential batches of work.
 //!
-//! For example many concurrent contending database update tasks can be bundled
-//! into bulk updates for each item in a batch.
+//! For example many concurrent contending single edatabase update tasks could be
+//! bundled into bulk updates.
 //!
 //! # Example
 //! ```
@@ -37,6 +37,7 @@
 //! use anyhow::anyhow;
 //!
 //! # async fn example() -> anyhow::Result<()> {
+//! // 3rd type is value returned by BatchResult::Done
 //! let batcher: BatchMutex<_, _, anyhow::Result<()>> = BatchMutex::default();
 //!
 //! # let (batch_key, my_item) = (1, 2);
@@ -70,6 +71,12 @@ use tokio::sync::{oneshot, OwnedMutexGuard};
 /// Batch HQ. Share and use concurrently to dynamically batch submitted items.
 ///
 /// Cheap to clone (`Arc` guts).
+/// 
+/// See [`BatchMutex::submit`] & crate docs.
+/// 
+/// * `Key` batch key type.
+/// * `Item` single item type to be batched together into a `Vec<Item>`.
+/// * `T` value returned by [`BatchResult::Done`], default `()`.
 #[derive(Clone)]
 pub struct BatchMutex<Key: Eq + Hash, Item, T = ()> {
     queue: Arc<DashMap<Key, BatchState<Key, Item, T>>>,
