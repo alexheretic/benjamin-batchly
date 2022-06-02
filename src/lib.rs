@@ -62,24 +62,17 @@
 //! }
 //! # }
 //! ```
+use dashmap::{mapref::entry::Entry, DashMap};
 use futures_util::future::{self, Either};
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    fmt,
-    hash::Hash,
-    mem,
-    sync::Arc,
-};
+use std::{fmt, hash::Hash, mem, sync::Arc};
 use tokio::sync::{oneshot, OwnedMutexGuard};
-
-type BatchMap<K, V, T> = HashMap<K, BatchState<K, V, T>>;
 
 /// Batch HQ. Share and use concurrently to dynamically batch submitted items.
 ///
 /// Cheap to clone (`Arc` guts).
 #[derive(Clone)]
 pub struct BatchMutex<Key: Eq + Hash, Item, T = ()> {
-    queue: Arc<std::sync::Mutex<BatchMap<Key, Item, T>>>,
+    queue: Arc<DashMap<Key, BatchState<Key, Item, T>>>,
 }
 
 impl<Key: Eq + Hash, Item, T> Default for BatchMutex<Key, Item, T> {
@@ -138,8 +131,7 @@ where
     pub async fn submit(&self, batch_key: Key, item: Item) -> BatchResult<Key, Item, T> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let batch_lock = {
-            let mut queue = self.queue.lock().unwrap();
-            let state = queue.entry(batch_key.clone()).or_default();
+            let mut state = self.queue.entry(batch_key.clone()).or_default();
             state.items.push(item);
             state.senders.push(tx);
             Arc::clone(&state.lock)
@@ -154,12 +146,9 @@ where
                 }
             }
             Either::Right((guard, rx)) => {
-                let batch = self
-                    .queue
-                    .lock()
-                    .unwrap()
-                    .get_mut(&batch_key)
-                    .map(move |state| Batch {
+                let batch = {
+                    let mut state = self.queue.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
+                    Batch {
                         guard: Some(guard),
                         items: mem::take(&mut state.items),
                         senders: state.senders.drain(..).map(Some).collect(),
@@ -168,9 +157,8 @@ where
                             key: Some(batch_key),
                         },
                         local_rx: rx,
-                    })
-                    .unwrap(); // should always exist in queue at this point
-
+                    }
+                };
                 BatchResult::Work(batch)
             }
         }
@@ -290,7 +278,7 @@ impl<Key: Eq + Hash + Clone, Item, T> Drop for Batch<Key, Item, T> {
 
 /// Handle that will try to clean up uncontended leftover batch state on drop.
 struct Cleaner<Key: Eq + Hash, Item, T> {
-    queue: Arc<std::sync::Mutex<BatchMap<Key, Item, T>>>,
+    queue: Arc<DashMap<Key, BatchState<Key, Item, T>>>,
     key: Option<Key>,
 }
 
@@ -307,8 +295,7 @@ impl<Key: Eq + Hash, Item, T> Drop for Cleaner<Key, Item, T> {
     fn drop(&mut self) {
         // try to cleanup leftover states if possible
         if let Some(key) = self.key.take() {
-            let mut queue = self.queue.lock().unwrap();
-            if let Entry::Occupied(entry) = queue.entry(key) {
+            if let Entry::Occupied(entry) = self.queue.entry(key) {
                 if Arc::strong_count(&entry.get().lock) == 1 {
                     entry.remove();
                 }
