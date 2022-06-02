@@ -3,17 +3,18 @@ name = "benjamin_batchly"
 version = "0.1.0"
 authors = ["Alex Butler <alexheretic@gmail.com>"]
 edition = "2021"
-# description = ""
-# repository = ""
-keywords = ["batch", "async"]
+description = """
+Low latency batching tool. Bundle lots of single concurrent operations into sequential batches of work.
+"""
+repository = "https://github.com/alexheretic/benjamin-batchly"
+keywords = ["batch", "async", "concurrent"]
 license = "Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-anyhow = "1.0.57"
-async-trait = "0.1.53"
+futures-util = { version = "0.3.21", default-features = false }
 tokio = { version = "1.18", features = ["sync"] }
-futures = "0.3.21"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+anyhow = "1.0.57"
+tokio = { version = "1", features = ["time", "macros", "rt"] }
