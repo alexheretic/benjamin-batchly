@@ -1,0 +1,19 @@
+[package]
+name = "benjamin_batchly"
+version = "0.1.0"
+authors = ["Alex Butler <alexheretic@gmail.com>"]
+edition = "2021"
+# description = ""
+# repository = ""
+keywords = ["batch", "async"]
+license = "Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.57"
+async-trait = "0.1.53"
+tokio = { version = "1.18", features = ["sync"] }
+futures = "0.3.21"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
