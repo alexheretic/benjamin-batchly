@@ -14,7 +14,7 @@ readme = "README.md"
 [dependencies]
 dashmap = "5.3.4"
 futures-util = { version = "0.3.21", default-features = false }
-tokio = { version = "1.18", features = ["sync"] }
+tokio = { version = "1.19", features = ["sync"] }
 
 [dev-dependencies]
 anyhow = "1.0.57"
