@@ -1,4 +1,3 @@
-use anyhow::Context;
 use benjamin_batchly::{BatchMutex, BatchResult};
 use std::{
     mem,
@@ -84,15 +83,15 @@ async fn batch_return_value() {
     );
 
     // First task (a) is unblocked and immediately does it's own work
-    assert!(matches!(a, Ok(Err(NotEven(97)))), "{a:?}");
+    assert!(matches!(a, ToU32Result::DidWork(Err(NotEven(97)))), "{a:?}");
 
     // task b awaits a then processes the batch
-    assert!(matches!(b, Ok(Ok(98))), "{b:?}");
+    assert!(matches!(b, ToU32Result::DidWork(Ok(98))), "{b:?}");
 
     // the remaining tasks are all notified by b
-    assert!(matches!(c, Ok(Err(NotEven(99)))), "{c:?}");
-    assert!(matches!(d, Ok(Ok(100))), "{d:?}");
-    assert!(matches!(e, Ok(Err(NotEven(101)))), "{e:?}");
+    assert!(matches!(c, ToU32Result::Done(Err(NotEven(99)))), "{c:?}");
+    assert!(matches!(d, ToU32Result::Done(Ok(100))), "{d:?}");
+    assert!(matches!(e, ToU32Result::Done(Err(NotEven(101)))), "{e:?}");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,10 +139,10 @@ async fn handle_convert_to_u32_if_even(
     batcher: &BatchMutex<i32, Item, Result<u32, NotEven>>,
     key: i32,
     item: Item,
-) -> anyhow::Result<Result<u32, NotEven>> {
+) -> ToU32Result<Result<u32, NotEven>> {
     match batcher.submit(key, item).await {
-        BatchResult::Done(v) => Ok(v),
-        BatchResult::Failed => Err(anyhow::anyhow!("BatchResult::Failed")),
+        BatchResult::Done(v) => ToU32Result::Done(v),
+        BatchResult::Failed => ToU32Result::Failed,
         BatchResult::Work(mut batch) => {
             let items = mem::take(&mut batch.items);
 
@@ -159,7 +158,18 @@ async fn handle_convert_to_u32_if_even(
                 }
             }
 
-            batch.recv_local_notify_done().context("did not recv local")
+            match batch.recv_local_notify_done() {
+                Some(v) => ToU32Result::DidWork(v),
+                None => ToU32Result::RecvLocalErr,
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToU32Result<T> {
+    Done(T),
+    Failed,
+    DidWork(T),
+    RecvLocalErr,
 }

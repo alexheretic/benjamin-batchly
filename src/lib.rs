@@ -71,9 +71,9 @@ use tokio::sync::{oneshot, OwnedMutexGuard};
 /// Batch HQ. Share and use concurrently to dynamically batch submitted items.
 ///
 /// Cheap to clone (`Arc` guts).
-/// 
+///
 /// See [`BatchMutex::submit`] & crate docs.
-/// 
+///
 /// * `Key` batch key type.
 /// * `Item` single item type to be batched together into a `Vec<Item>`.
 /// * `T` value returned by [`BatchResult::Done`], default `()`.
