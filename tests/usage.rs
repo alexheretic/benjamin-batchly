@@ -39,6 +39,26 @@ async fn batch_all_ok() {
 }
 
 #[tokio::test]
+async fn batch_different_keys() {
+    let batcher = BatchMutex::default();
+
+    let (a, b, c, d, e) = tokio::join!(
+        handle_batch_in_100ms(&batcher, 45, Item('a')),
+        handle_batch_in_100ms(&batcher, 56, Item('b')),
+        handle_batch_in_100ms(&batcher, 67, Item('c')),
+        handle_batch_in_100ms(&batcher, 78, Item('d')),
+        handle_batch_in_100ms(&batcher, 89, Item('e')),
+    );
+
+    // All tasks are unrelated batches of 1
+    assert_eq!(a.0, HandleResult::DidWork(vec![Item('a')]));
+    assert_eq!(b.0, HandleResult::DidWork(vec![Item('b')]));
+    assert_eq!(c.0, HandleResult::DidWork(vec![Item('c')]));
+    assert_eq!(d.0, HandleResult::DidWork(vec![Item('d')]));
+    assert_eq!(e.0, HandleResult::DidWork(vec![Item('e')]));
+}
+
+#[tokio::test]
 async fn batch_cancelled() {
     let batcher = BatchMutex::default();
 
