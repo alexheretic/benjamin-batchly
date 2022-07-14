@@ -39,6 +39,38 @@ async fn batch_all_ok() {
 }
 
 #[tokio::test]
+async fn batch_all_ok_pull_waiting_items() {
+    let batcher = BatchMutex::default();
+
+    let batch_key = 123;
+
+    let (a, b, c, d, e) = tokio::join!(
+        lock_30ms_pull_waiting_items_and_handle_in_50ms(&batcher, batch_key, Item('a')),
+        lock_30ms_pull_waiting_items_and_handle_in_50ms(&batcher, batch_key, Item('b')),
+        lock_30ms_pull_waiting_items_and_handle_in_50ms(&batcher, batch_key, Item('c')),
+        lock_30ms_pull_waiting_items_and_handle_in_50ms(&batcher, batch_key, Item('d')),
+        lock_30ms_pull_waiting_items_and_handle_in_50ms(&batcher, batch_key, Item('e')),
+    );
+
+    // First task (a) is unblocked and immediately does it's own work
+    // after 30ms it tries to `pull_waiting_items` pulling in the rest f the tasks
+    assert_eq!(
+        a.0,
+        HandleResult::DidWork(vec![Item('a'), Item('b'), Item('c'), Item('d'), Item('e')])
+    );
+
+    // since task a handled all tasks the rest return `Done`
+    assert_eq!(b.0, HandleResult::Done(()));
+    assert!(b.1 >= a.1);
+    assert_eq!(c.0, HandleResult::Done(()));
+    assert!(c.1 >= b.1);
+    assert_eq!(d.0, HandleResult::Done(()));
+    assert!(d.1 >= b.1);
+    assert_eq!(e.0, HandleResult::Done(()));
+    assert!(e.1 >= b.1);
+}
+
+#[tokio::test]
 async fn batch_different_keys() {
     let batcher = BatchMutex::default();
 
@@ -127,8 +159,7 @@ async fn handle_batch_in_100ms(
         BatchResult::Done(_) => (HandleResult::Done(()), Instant::now()),
         BatchResult::Failed => (HandleResult::Failed, Instant::now()),
         BatchResult::Work(mut batch) => {
-            let items = mem::take(&mut batch.items);
-            assert_eq!(items[0], item);
+            assert_eq!(batch.items[0], item);
 
             // simuluate some io
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -137,7 +168,35 @@ async fn handle_batch_in_100ms(
             // notify that each task succeeded
             batch.notify_all_done();
 
-            (HandleResult::DidWork(items), finish)
+            (HandleResult::DidWork(mem::take(&mut batch.items)), finish)
+        }
+    }
+}
+
+/// Submit and handle batch in ~100ms.
+async fn lock_30ms_pull_waiting_items_and_handle_in_50ms(
+    batcher: &BatchMutex<i32, Item>,
+    key: i32,
+    item: Item,
+) -> (HandleResult, Instant) {
+    match batcher.submit(key, item).await {
+        BatchResult::Done(_) => (HandleResult::Done(()), Instant::now()),
+        BatchResult::Failed => (HandleResult::Failed, Instant::now()),
+        BatchResult::Work(mut batch) => {
+            assert_eq!(batch.items[0], item);
+
+            // simuluate some initial io (like a distributed lock)
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            batch.pull_waiting_items();
+
+            // simuluate some io
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let finish = Instant::now();
+
+            // notify that each task succeeded
+            batch.notify_all_done();
+
+            (HandleResult::DidWork(mem::take(&mut batch.items)), finish)
         }
     }
 }

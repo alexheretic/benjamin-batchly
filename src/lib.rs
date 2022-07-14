@@ -237,10 +237,12 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
     ///
     /// This means the submitter of that item will receive a [`BatchResult::Done`] with the done value.
     ///
+    /// Note `item_index` is the original index of the item in [`Batch::items`].
+    ///
     /// If the item is the local item, the one submitted by the same caller handling the batch,
     /// the result may be received using [`Batch::recv_local_notify_done`].
     pub fn notify_done(&mut self, item_index: usize, val: T) {
-        if let Some(tx) = self.senders[item_index].take() {
+        if let Some(tx) = self.senders.get_mut(item_index).and_then(|i| i.take()) {
             let _ = tx.send(Ok((val, self.cleaner.clone())));
         }
     }
@@ -256,9 +258,31 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
         self.local_rx.try_recv().ok().and_then(|v| Some(v.ok()?.0))
     }
 
+    /// Takes items that have been submitted after this [`Batch`] was returned and adds
+    /// them to this batch to be processed immediately.
+    ///
+    /// New items are appended onto [`Batch::items`].
+    ///
+    /// Returns `true` if any new items were pulled in.
+    pub fn pull_waiting_items(&mut self) -> bool {
+        if let Some(mut next) = self
+            .cleaner
+            .key
+            .as_ref()
+            .and_then(|k| self.cleaner.queue.get_mut(k))
+            .filter(|n| !n.items.is_empty())
+        {
+            self.items.append(&mut next.items);
+            self.senders.extend(next.senders.drain(..).map(Some));
+            true
+        } else {
+            false
+        }
+    }
+
     fn notify_all_failed(&mut self) {
-        for tx in self.senders.drain(..) {
-            let _ = tx.map(|tx| tx.send(Err(self.cleaner.clone())));
+        for tx in &mut self.senders {
+            let _ = tx.take().map(|tx| tx.send(Err(self.cleaner.clone())));
         }
     }
 }
@@ -270,8 +294,8 @@ impl<Key: Eq + Hash + Clone, Item> Batch<Key, Item, ()> {
     ///
     /// Convenience method when using no/`()` item return value.
     pub fn notify_all_done(&mut self) {
-        for tx in self.senders.drain(..) {
-            let _ = tx.map(|tx| tx.send(Ok(((), self.cleaner.clone()))));
+        for tx in &mut self.senders {
+            let _ = tx.take().map(|tx| tx.send(Ok(((), self.cleaner.clone()))));
         }
     }
 }
