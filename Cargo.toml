@@ -1,6 +1,6 @@
 [package]
 name = "benjamin_batchly"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Alex Butler <alexheretic@gmail.com>"]
 edition = "2021"
 description = """
