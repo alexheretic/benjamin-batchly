@@ -12,7 +12,6 @@ license = "Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-futures-util = { version = "0.3.21", default-features = false }
 tokio = { version = "1.19", features = ["sync"] }
 
 [dev-dependencies]

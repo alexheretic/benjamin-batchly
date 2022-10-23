@@ -63,20 +63,22 @@
 //! }
 //! # }
 //! ```
-use futures_util::future::{self, Either};
 use std::{
     collections::{
         hash_map::{Entry, RandomState},
         HashMap,
     },
     fmt,
+    future::Future,
     hash::{BuildHasher, Hash, Hasher},
     mem,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
 };
 use tokio::{
     pin,
-    sync::{oneshot, OwnedSemaphorePermit, Semaphore},
+    sync::{oneshot, AcquireError, OwnedSemaphorePermit, Semaphore},
 };
 
 /// Batch HQ. Share and use concurrently to dynamically batch submitted items.
@@ -187,17 +189,15 @@ where
         let lock = batch_lock.acquire_owned();
         pin!(lock);
 
-        match future::select(rx, lock).await {
-            Either::Left((result, _)) => match result {
-                Ok(Some(val)) => BatchResult::Done(val),
-                Err(_) | Ok(None) => BatchResult::Failed,
-            },
-            Either::Right((guard, rx)) => {
+        match WorkPermitSelect::new(rx, lock).await {
+            WorkPermit::Result(Some(val)) => BatchResult::Done(val),
+            WorkPermit::Result(None) => BatchResult::Failed,
+            WorkPermit::Permit(guard, rx) => {
                 let batch = {
                     let mut shard = self.get_shard(&batch_key).lock().unwrap();
                     let state = shard.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
                     Batch {
-                        guard: Some(guard.expect("we never close the semaphore")),
+                        guard,
                         items: mem::take(&mut state.items),
                         senders: state.senders.drain(..).map(Some).collect(),
                         cleaner: Cleaner {
@@ -366,5 +366,44 @@ impl<Key: Eq + Hash, Item, T> Drop for Cleaner<Key, Item, T> {
                 }
             }
         }
+    }
+}
+
+enum WorkPermit<T> {
+    Result(Option<T>),
+    Permit(Option<OwnedSemaphorePermit>, Receiver<T>),
+}
+
+struct WorkPermitSelect<'a, T, Acquire> {
+    inner: Option<(Receiver<T>, Pin<&'a mut Acquire>)>,
+}
+
+impl<'a, T, Acquire> WorkPermitSelect<'a, T, Acquire> {
+    fn new(rx: Receiver<T>, acq: Pin<&'a mut Acquire>) -> Self {
+        Self {
+            inner: Some((rx, acq)),
+        }
+    }
+}
+
+impl<T, Acquire> Future for WorkPermitSelect<'_, T, Acquire>
+where
+    Acquire: Future<Output = Result<OwnedSemaphorePermit, AcquireError>>,
+{
+    type Output = WorkPermit<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (mut a, mut b) = self.inner.take().expect("cannot poll Select twice");
+
+        if let Poll::Ready(val) = Pin::new(&mut a).poll(cx) {
+            return Poll::Ready(WorkPermit::Result(val.ok().flatten()));
+        }
+
+        if let Poll::Ready(val) = b.as_mut().poll(cx) {
+            return Poll::Ready(WorkPermit::Permit(val.ok(), a));
+        }
+
+        self.inner = Some((a, b));
+        Poll::Pending
     }
 }
