@@ -63,9 +63,17 @@
 //! }
 //! # }
 //! ```
-use dashmap::{mapref::entry::Entry, DashMap};
 use futures_util::future::{self, Either};
-use std::{fmt, hash::Hash, mem, sync::Arc};
+use std::{
+    collections::{
+        hash_map::{Entry, RandomState},
+        HashMap,
+    },
+    fmt,
+    hash::{BuildHasher, Hash, Hasher},
+    mem,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::{oneshot, OwnedMutexGuard};
 
 /// Batch HQ. Share and use concurrently to dynamically batch submitted items.
@@ -77,15 +85,30 @@ use tokio::sync::{oneshot, OwnedMutexGuard};
 /// * `Key` batch key type.
 /// * `Item` single item type to be batched together into a `Vec<Item>`.
 /// * `T` value returned by [`BatchResult::Done`], default `()`.
-#[derive(Clone)]
-pub struct BatchMutex<Key: Eq + Hash, Item, T = ()> {
-    queue: Arc<DashMap<Key, BatchState<Item, T>>>,
+pub struct BatchMutex<Key, Item, T = ()> {
+    hasher: RandomState,
+    queue: Arc<[Shard<Key, Item, T>]>,
+}
+type Shard<K, I, T> = Mutex<HashMap<K, BatchState<I, T>>>;
+
+impl<Key, Item, T> Clone for BatchMutex<Key, Item, T> {
+    fn clone(&self) -> Self {
+        Self {
+            hasher: self.hasher.clone(),
+            queue: self.queue.clone(),
+        }
+    }
 }
 
 impl<Key: Eq + Hash, Item, T> Default for BatchMutex<Key, Item, T> {
     fn default() -> Self {
+        let cap =
+            (std::thread::available_parallelism().map_or(1, usize::from) * 4).next_power_of_two();
+        let mut shards = Vec::with_capacity(cap);
+        shards.resize_with(cap, || Mutex::new(HashMap::new()));
         Self {
-            queue: <_>::default(),
+            hasher: RandomState::new(),
+            queue: shards.into_boxed_slice().into(),
         }
     }
 }
@@ -97,6 +120,19 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BatchMutex").finish_non_exhaustive()
+    }
+}
+
+impl<Key, Item, T> BatchMutex<Key, Item, T>
+where
+    Key: Eq + Hash,
+{
+    fn get_shard(&self, key: &Key) -> &Shard<Key, Item, T> {
+        let mut hasher = self.hasher.build_hasher();
+        key.hash(&mut hasher);
+        // queue len is always a power of two, so it should evenly divide the hash space and be fair
+        let index = (hasher.finish()) as usize % self.queue.len();
+        &self.queue[index]
     }
 }
 
@@ -138,7 +174,8 @@ where
     pub async fn submit(&self, batch_key: Key, item: Item) -> BatchResult<Key, Item, T> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let batch_lock = {
-            let mut state = self.queue.entry(batch_key.clone()).or_default();
+            let mut shard = self.get_shard(&batch_key).lock().unwrap();
+            let state = shard.entry(batch_key.clone()).or_default();
             state.items.push(item);
             state.senders.push(tx);
             Arc::clone(&state.lock)
@@ -154,13 +191,14 @@ where
             }
             Either::Right((guard, rx)) => {
                 let batch = {
-                    let mut state = self.queue.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
+                    let mut shard = self.get_shard(&batch_key).lock().unwrap();
+                    let state = shard.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
                     Batch {
                         guard: Some(guard),
                         items: mem::take(&mut state.items),
                         senders: state.senders.drain(..).map(Some).collect(),
                         cleaner: Cleaner {
-                            queue: Arc::clone(&self.queue),
+                            queue: self.clone(),
                             key: Some(batch_key),
                         },
                         local_rx: rx,
@@ -265,16 +303,16 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
     ///
     /// Returns `true` if any new items were pulled in.
     pub fn pull_waiting_items(&mut self) -> bool {
-        if let Some(mut next) = self
-            .cleaner
-            .key
-            .as_ref()
-            .and_then(|k| self.cleaner.queue.get_mut(k))
-            .filter(|n| !n.items.is_empty())
-        {
-            self.items.append(&mut next.items);
-            self.senders.extend(next.senders.drain(..).map(Some));
-            true
+        if let Some(key) = self.cleaner.key.as_ref() {
+            let mut shard = self.cleaner.queue.get_shard(key).lock().unwrap();
+            match shard.get_mut(key) {
+                Some(next) if !next.items.is_empty() => {
+                    self.items.append(&mut next.items);
+                    self.senders.extend(next.senders.drain(..).map(Some));
+                    true
+                }
+                _ => false,
+            }
         } else {
             false
         }
@@ -308,25 +346,18 @@ impl<Key: Eq + Hash + Clone, Item, T> Drop for Batch<Key, Item, T> {
 }
 
 /// Handle that will try to clean up uncontended leftover batch state on drop.
+#[derive(Clone)]
 struct Cleaner<Key: Eq + Hash, Item, T> {
-    queue: Arc<DashMap<Key, BatchState<Item, T>>>,
+    queue: BatchMutex<Key, Item, T>,
     key: Option<Key>,
-}
-
-impl<Key: Eq + Hash + Clone, Item, T> Clone for Cleaner<Key, Item, T> {
-    fn clone(&self) -> Self {
-        Self {
-            queue: Arc::clone(&self.queue),
-            key: self.key.clone(),
-        }
-    }
 }
 
 impl<Key: Eq + Hash, Item, T> Drop for Cleaner<Key, Item, T> {
     fn drop(&mut self) {
         // try to cleanup leftover states if possible
         if let Some(key) = self.key.take() {
-            if let Entry::Occupied(entry) = self.queue.entry(key) {
+            let mut shard = self.queue.get_shard(&key).lock().unwrap();
+            if let Entry::Occupied(entry) = shard.entry(key) {
                 if Arc::strong_count(&entry.get().lock) == 1 {
                     entry.remove();
                 }
