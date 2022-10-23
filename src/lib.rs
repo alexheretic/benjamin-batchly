@@ -74,7 +74,10 @@ use std::{
     mem,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{oneshot, OwnedMutexGuard};
+use tokio::{
+    pin,
+    sync::{oneshot, OwnedSemaphorePermit, Semaphore},
+};
 
 /// Batch HQ. Share and use concurrently to dynamically batch submitted items.
 ///
@@ -181,20 +184,20 @@ where
             Arc::clone(&state.lock)
         };
 
-        match future::select(rx, Box::pin(batch_lock.lock_owned())).await {
-            Either::Left((result, guard)) => {
-                drop(guard);
-                match result {
-                    Ok(Some(val)) => BatchResult::Done(val),
-                    Err(_) | Ok(None) => BatchResult::Failed,
-                }
-            }
+        let lock = batch_lock.acquire_owned();
+        pin!(lock);
+
+        match future::select(rx, lock).await {
+            Either::Left((result, _)) => match result {
+                Ok(Some(val)) => BatchResult::Done(val),
+                Err(_) | Ok(None) => BatchResult::Failed,
+            },
             Either::Right((guard, rx)) => {
                 let batch = {
                     let mut shard = self.get_shard(&batch_key).lock().unwrap();
                     let state = shard.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
                     Batch {
-                        guard: Some(guard),
+                        guard: Some(guard.expect("we never close the semaphore")),
                         items: mem::take(&mut state.items),
                         senders: state.senders.drain(..).map(Some).collect(),
                         cleaner: Cleaner {
@@ -213,7 +216,7 @@ where
 struct BatchState<Item, T> {
     items: Vec<Item>,
     senders: Vec<Sender<T>>,
-    lock: Arc<tokio::sync::Mutex<()>>,
+    lock: Arc<Semaphore>,
 }
 
 type Sender<T> = oneshot::Sender<Option<T>>;
@@ -224,7 +227,7 @@ impl<Item, T> Default for BatchState<Item, T> {
         Self {
             items: <_>::default(),
             senders: <_>::default(),
-            lock: <_>::default(),
+            lock: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -252,7 +255,7 @@ pub enum BatchResult<Key: Eq + Hash + Clone, Item, T> {
 pub struct Batch<Key: Eq + Hash + Clone, Item, T> {
     /// Batch items.
     pub items: Vec<Item>,
-    guard: Option<OwnedMutexGuard<()>>,
+    guard: Option<OwnedSemaphorePermit>,
     senders: Vec<Option<Sender<T>>>,
     cleaner: Cleaner<Key, Item, T>,
     local_rx: Receiver<T>,
