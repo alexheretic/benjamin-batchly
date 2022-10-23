@@ -193,17 +193,18 @@ where
             WorkPermit::Result(Some(val)) => BatchResult::Done(val),
             WorkPermit::Result(None) => BatchResult::Failed,
             WorkPermit::Permit(guard, rx) => {
+                if let Some(guard) = guard {
+                    // we return the permit in `Batch::drop`
+                    guard.forget()
+                }
                 let batch = {
                     let mut shard = self.get_shard(&batch_key).lock().unwrap();
                     let state = shard.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
                     Batch {
-                        guard,
                         items: mem::take(&mut state.items),
                         senders: state.senders.drain(..).map(Some).collect(),
-                        cleaner: Cleaner {
-                            queue: self.clone(),
-                            key: Some(batch_key),
-                        },
+                        queue: self.clone(),
+                        key: Some(batch_key),
                         local_rx: rx,
                     }
                 };
@@ -252,18 +253,18 @@ pub enum BatchResult<Key: Eq + Hash + Clone, Item, T> {
 }
 
 /// A batch of items to process.
-pub struct Batch<Key: Eq + Hash + Clone, Item, T> {
+pub struct Batch<Key: Eq + Hash, Item, T> {
     /// Batch items.
     pub items: Vec<Item>,
-    guard: Option<OwnedSemaphorePermit>,
     senders: Vec<Option<Sender<T>>>,
-    cleaner: Cleaner<Key, Item, T>,
+    queue: BatchMutex<Key, Item, T>,
+    key: Option<Key>,
     local_rx: Receiver<T>,
 }
 
 impl<Key, Item, T> fmt::Debug for Batch<Key, Item, T>
 where
-    Key: Eq + Hash + Clone,
+    Key: Eq + Hash,
     Item: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -273,7 +274,7 @@ where
     }
 }
 
-impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
+impl<Key: Eq + Hash, Item, T> Batch<Key, Item, T> {
     /// Notify an individual item as done.
     ///
     /// This means the submitter of that item will receive a [`BatchResult::Done`] with the done value.
@@ -306,8 +307,8 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
     ///
     /// Returns `true` if any new items were pulled in.
     pub fn pull_waiting_items(&mut self) -> bool {
-        if let Some(key) = self.cleaner.key.as_ref() {
-            let mut shard = self.cleaner.queue.get_shard(key).lock().unwrap();
+        if let Some(key) = self.key.as_ref() {
+            let mut shard = self.queue.get_shard(key).lock().unwrap();
             match shard.get_mut(key) {
                 Some(next) if !next.items.is_empty() => {
                     self.items.append(&mut next.items);
@@ -341,28 +342,18 @@ impl<Key: Eq + Hash + Clone, Item> Batch<Key, Item, ()> {
     }
 }
 
-impl<Key: Eq + Hash + Clone, Item, T> Drop for Batch<Key, Item, T> {
+impl<Key: Eq + Hash, Item, T> Drop for Batch<Key, Item, T> {
     fn drop(&mut self) {
-        self.notify_all_failed(); // handle senders before dropping guard
-        self.guard.take(); // drop before cleaner
-    }
-}
-
-/// Handle that will try to clean up uncontended leftover batch state on drop.
-#[derive(Clone)]
-struct Cleaner<Key: Eq + Hash, Item, T> {
-    queue: BatchMutex<Key, Item, T>,
-    key: Option<Key>,
-}
-
-impl<Key: Eq + Hash, Item, T> Drop for Cleaner<Key, Item, T> {
-    fn drop(&mut self) {
+        self.notify_all_failed();
         // try to cleanup leftover states if possible
         if let Some(key) = self.key.take() {
             let mut shard = self.queue.get_shard(&key).lock().unwrap();
             if let Entry::Occupied(entry) = shard.entry(key) {
                 if Arc::strong_count(&entry.get().lock) == 1 {
                     entry.remove();
+                } else {
+                    // return the permit
+                    entry.get().lock.add_permits(1);
                 }
             }
         }
