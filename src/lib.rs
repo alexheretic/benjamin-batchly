@@ -79,7 +79,7 @@ use tokio::sync::{oneshot, OwnedMutexGuard};
 /// * `T` value returned by [`BatchResult::Done`], default `()`.
 #[derive(Clone)]
 pub struct BatchMutex<Key: Eq + Hash, Item, T = ()> {
-    queue: Arc<DashMap<Key, BatchState<Key, Item, T>>>,
+    queue: Arc<DashMap<Key, BatchState<Item, T>>>,
 }
 
 impl<Key: Eq + Hash, Item, T> Default for BatchMutex<Key, Item, T> {
@@ -148,8 +148,8 @@ where
             Either::Left((result, guard)) => {
                 drop(guard);
                 match result {
-                    Ok(Ok((val, _))) => BatchResult::Done(val),
-                    Err(_) | Ok(Err(_)) => BatchResult::Failed,
+                    Ok(Some(val)) => BatchResult::Done(val),
+                    Err(_) | Ok(None) => BatchResult::Failed,
                 }
             }
             Either::Right((guard, rx)) => {
@@ -172,16 +172,16 @@ where
     }
 }
 
-struct BatchState<Key: Eq + Hash, Item, T> {
+struct BatchState<Item, T> {
     items: Vec<Item>,
-    senders: Vec<Sender<Key, Item, T>>,
+    senders: Vec<Sender<T>>,
     lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-type Sender<K, V, T> = oneshot::Sender<Result<(T, Cleaner<K, V, T>), Cleaner<K, V, T>>>;
-type Receiver<K, V, T> = oneshot::Receiver<Result<(T, Cleaner<K, V, T>), Cleaner<K, V, T>>>;
+type Sender<T> = oneshot::Sender<Option<T>>;
+type Receiver<T> = oneshot::Receiver<Option<T>>;
 
-impl<Key: Eq + Hash, Item, T> Default for BatchState<Key, Item, T> {
+impl<Item, T> Default for BatchState<Item, T> {
     fn default() -> Self {
         Self {
             items: <_>::default(),
@@ -215,9 +215,9 @@ pub struct Batch<Key: Eq + Hash + Clone, Item, T> {
     /// Batch items.
     pub items: Vec<Item>,
     guard: Option<OwnedMutexGuard<()>>,
-    senders: Vec<Option<Sender<Key, Item, T>>>,
+    senders: Vec<Option<Sender<T>>>,
     cleaner: Cleaner<Key, Item, T>,
-    local_rx: Receiver<Key, Item, T>,
+    local_rx: Receiver<T>,
 }
 
 impl<Key, Item, T> fmt::Debug for Batch<Key, Item, T>
@@ -243,7 +243,7 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
     /// the result may be received using [`Batch::recv_local_notify_done`].
     pub fn notify_done(&mut self, item_index: usize, val: T) {
         if let Some(tx) = self.senders.get_mut(item_index).and_then(|i| i.take()) {
-            let _ = tx.send(Ok((val, self.cleaner.clone())));
+            let _ = tx.send(Some(val));
         }
     }
 
@@ -255,7 +255,7 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
     /// can be used to get the local computation result after handling all items and calling
     /// [`Batch::notify_done`] for each (one of which is the local item).
     pub fn recv_local_notify_done(&mut self) -> Option<T> {
-        self.local_rx.try_recv().ok().and_then(|v| Some(v.ok()?.0))
+        self.local_rx.try_recv().ok().flatten()
     }
 
     /// Takes items that have been submitted after this [`Batch`] was returned and adds
@@ -282,7 +282,7 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
 
     fn notify_all_failed(&mut self) {
         for tx in &mut self.senders {
-            let _ = tx.take().map(|tx| tx.send(Err(self.cleaner.clone())));
+            let _ = tx.take().map(|tx| tx.send(None));
         }
     }
 }
@@ -295,7 +295,7 @@ impl<Key: Eq + Hash + Clone, Item> Batch<Key, Item, ()> {
     /// Convenience method when using no/`()` item return value.
     pub fn notify_all_done(&mut self) {
         for tx in &mut self.senders {
-            let _ = tx.take().map(|tx| tx.send(Ok(((), self.cleaner.clone()))));
+            let _ = tx.take().map(|tx| tx.send(Some(())));
         }
     }
 }
@@ -309,7 +309,7 @@ impl<Key: Eq + Hash + Clone, Item, T> Drop for Batch<Key, Item, T> {
 
 /// Handle that will try to clean up uncontended leftover batch state on drop.
 struct Cleaner<Key: Eq + Hash, Item, T> {
-    queue: Arc<DashMap<Key, BatchState<Key, Item, T>>>,
+    queue: Arc<DashMap<Key, BatchState<Item, T>>>,
     key: Option<Key>,
 }
 
