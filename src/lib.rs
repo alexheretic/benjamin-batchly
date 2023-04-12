@@ -33,8 +33,8 @@
 //!
 //! E.g. a `Result` to pass back why some batch items failed to their submitters.
 //! ```
-//! use benjamin_batchly::{BatchMutex, BatchResult};
 //! use anyhow::anyhow;
+//! use benjamin_batchly::{BatchMutex, BatchResult};
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! // 3rd type is value returned by BatchResult::Done
