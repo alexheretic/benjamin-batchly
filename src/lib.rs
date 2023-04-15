@@ -63,10 +63,23 @@
 //! }
 //! # }
 //! ```
-use dashmap::{mapref::entry::Entry, DashMap};
-use futures_util::future::{self, Either};
-use std::{fmt, hash::Hash, mem, sync::Arc};
-use tokio::sync::{oneshot, OwnedMutexGuard};
+use std::{
+    collections::{
+        hash_map::{Entry, RandomState},
+        HashMap,
+    },
+    fmt,
+    future::Future,
+    hash::{BuildHasher, Hash, Hasher},
+    mem,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+};
+use tokio::{
+    pin,
+    sync::{oneshot, AcquireError, OwnedSemaphorePermit, Semaphore},
+};
 
 /// Batch HQ. Share and use concurrently to dynamically batch submitted items.
 ///
@@ -77,15 +90,30 @@ use tokio::sync::{oneshot, OwnedMutexGuard};
 /// * `Key` batch key type.
 /// * `Item` single item type to be batched together into a `Vec<Item>`.
 /// * `T` value returned by [`BatchResult::Done`], default `()`.
-#[derive(Clone)]
-pub struct BatchMutex<Key: Eq + Hash, Item, T = ()> {
-    queue: Arc<DashMap<Key, BatchState<Key, Item, T>>>,
+pub struct BatchMutex<Key, Item, T = ()> {
+    hasher: RandomState,
+    queue: Arc<[Shard<Key, Item, T>]>,
+}
+type Shard<K, I, T> = Mutex<HashMap<K, BatchState<I, T>>>;
+
+impl<Key, Item, T> Clone for BatchMutex<Key, Item, T> {
+    fn clone(&self) -> Self {
+        Self {
+            hasher: self.hasher.clone(),
+            queue: self.queue.clone(),
+        }
+    }
 }
 
 impl<Key: Eq + Hash, Item, T> Default for BatchMutex<Key, Item, T> {
     fn default() -> Self {
+        let cap =
+            (std::thread::available_parallelism().map_or(1, usize::from) * 4).next_power_of_two();
+        let mut shards = Vec::with_capacity(cap);
+        shards.resize_with(cap, || Mutex::new(HashMap::new()));
         Self {
-            queue: <_>::default(),
+            hasher: RandomState::new(),
+            queue: shards.into_boxed_slice().into(),
         }
     }
 }
@@ -97,6 +125,19 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BatchMutex").finish_non_exhaustive()
+    }
+}
+
+impl<Key, Item, T> BatchMutex<Key, Item, T>
+where
+    Key: Eq + Hash,
+{
+    fn get_shard(&self, key: &Key) -> &Shard<Key, Item, T> {
+        let mut hasher = self.hasher.build_hasher();
+        key.hash(&mut hasher);
+        // queue len is always a power of two, so it should evenly divide the hash space and be fair
+        let index = (hasher.finish()) as usize % self.queue.len();
+        &self.queue[index]
     }
 }
 
@@ -138,31 +179,32 @@ where
     pub async fn submit(&self, batch_key: Key, item: Item) -> BatchResult<Key, Item, T> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let batch_lock = {
-            let mut state = self.queue.entry(batch_key.clone()).or_default();
+            let mut shard = self.get_shard(&batch_key).lock().unwrap();
+            let state = shard.entry(batch_key.clone()).or_default();
             state.items.push(item);
             state.senders.push(tx);
             Arc::clone(&state.lock)
         };
 
-        match future::select(rx, Box::pin(batch_lock.lock_owned())).await {
-            Either::Left((result, guard)) => {
-                drop(guard);
-                match result {
-                    Ok(Ok((val, _))) => BatchResult::Done(val),
-                    Err(_) | Ok(Err(_)) => BatchResult::Failed,
+        let lock = batch_lock.acquire_owned();
+        pin!(lock);
+
+        match WorkPermitSelect::new(rx, lock).await {
+            WorkPermit::Result(Some(val)) => BatchResult::Done(val),
+            WorkPermit::Result(None) => BatchResult::Failed,
+            WorkPermit::Permit(guard, rx) => {
+                if let Some(guard) = guard {
+                    // we return the permit in `Batch::drop`
+                    guard.forget()
                 }
-            }
-            Either::Right((guard, rx)) => {
                 let batch = {
-                    let mut state = self.queue.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
+                    let mut shard = self.get_shard(&batch_key).lock().unwrap();
+                    let state = shard.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
                     Batch {
-                        guard: Some(guard),
                         items: mem::take(&mut state.items),
                         senders: state.senders.drain(..).map(Some).collect(),
-                        cleaner: Cleaner {
-                            queue: Arc::clone(&self.queue),
-                            key: Some(batch_key),
-                        },
+                        queue: self.clone(),
+                        key: Some(batch_key),
                         local_rx: rx,
                     }
                 };
@@ -172,21 +214,21 @@ where
     }
 }
 
-struct BatchState<Key: Eq + Hash, Item, T> {
+struct BatchState<Item, T> {
     items: Vec<Item>,
-    senders: Vec<Sender<Key, Item, T>>,
-    lock: Arc<tokio::sync::Mutex<()>>,
+    senders: Vec<Sender<T>>,
+    lock: Arc<Semaphore>,
 }
 
-type Sender<K, V, T> = oneshot::Sender<Result<(T, Cleaner<K, V, T>), Cleaner<K, V, T>>>;
-type Receiver<K, V, T> = oneshot::Receiver<Result<(T, Cleaner<K, V, T>), Cleaner<K, V, T>>>;
+type Sender<T> = oneshot::Sender<Option<T>>;
+type Receiver<T> = oneshot::Receiver<Option<T>>;
 
-impl<Key: Eq + Hash, Item, T> Default for BatchState<Key, Item, T> {
+impl<Item, T> Default for BatchState<Item, T> {
     fn default() -> Self {
         Self {
             items: <_>::default(),
             senders: <_>::default(),
-            lock: <_>::default(),
+            lock: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -211,18 +253,18 @@ pub enum BatchResult<Key: Eq + Hash + Clone, Item, T> {
 }
 
 /// A batch of items to process.
-pub struct Batch<Key: Eq + Hash + Clone, Item, T> {
+pub struct Batch<Key: Eq + Hash, Item, T> {
     /// Batch items.
     pub items: Vec<Item>,
-    guard: Option<OwnedMutexGuard<()>>,
-    senders: Vec<Option<Sender<Key, Item, T>>>,
-    cleaner: Cleaner<Key, Item, T>,
-    local_rx: Receiver<Key, Item, T>,
+    senders: Vec<Option<Sender<T>>>,
+    queue: BatchMutex<Key, Item, T>,
+    key: Option<Key>,
+    local_rx: Receiver<T>,
 }
 
 impl<Key, Item, T> fmt::Debug for Batch<Key, Item, T>
 where
-    Key: Eq + Hash + Clone,
+    Key: Eq + Hash,
     Item: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -232,7 +274,7 @@ where
     }
 }
 
-impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
+impl<Key: Eq + Hash, Item, T> Batch<Key, Item, T> {
     /// Notify an individual item as done.
     ///
     /// This means the submitter of that item will receive a [`BatchResult::Done`] with the done value.
@@ -243,7 +285,7 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
     /// the result may be received using [`Batch::recv_local_notify_done`].
     pub fn notify_done(&mut self, item_index: usize, val: T) {
         if let Some(tx) = self.senders.get_mut(item_index).and_then(|i| i.take()) {
-            let _ = tx.send(Ok((val, self.cleaner.clone())));
+            let _ = tx.send(Some(val));
         }
     }
 
@@ -255,7 +297,7 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
     /// can be used to get the local computation result after handling all items and calling
     /// [`Batch::notify_done`] for each (one of which is the local item).
     pub fn recv_local_notify_done(&mut self) -> Option<T> {
-        self.local_rx.try_recv().ok().and_then(|v| Some(v.ok()?.0))
+        self.local_rx.try_recv().ok().flatten()
     }
 
     /// Takes items that have been submitted after this [`Batch`] was returned and adds
@@ -265,16 +307,16 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
     ///
     /// Returns `true` if any new items were pulled in.
     pub fn pull_waiting_items(&mut self) -> bool {
-        if let Some(mut next) = self
-            .cleaner
-            .key
-            .as_ref()
-            .and_then(|k| self.cleaner.queue.get_mut(k))
-            .filter(|n| !n.items.is_empty())
-        {
-            self.items.append(&mut next.items);
-            self.senders.extend(next.senders.drain(..).map(Some));
-            true
+        if let Some(key) = self.key.as_ref() {
+            let mut shard = self.queue.get_shard(key).lock().unwrap();
+            match shard.get_mut(key) {
+                Some(next) if !next.items.is_empty() => {
+                    self.items.append(&mut next.items);
+                    self.senders.extend(next.senders.drain(..).map(Some));
+                    true
+                }
+                _ => false,
+            }
         } else {
             false
         }
@@ -282,7 +324,7 @@ impl<Key: Eq + Hash + Clone, Item, T> Batch<Key, Item, T> {
 
     fn notify_all_failed(&mut self) {
         for tx in &mut self.senders {
-            let _ = tx.take().map(|tx| tx.send(Err(self.cleaner.clone())));
+            let _ = tx.take().map(|tx| tx.send(None));
         }
     }
 }
@@ -295,42 +337,64 @@ impl<Key: Eq + Hash + Clone, Item> Batch<Key, Item, ()> {
     /// Convenience method when using no/`()` item return value.
     pub fn notify_all_done(&mut self) {
         for tx in &mut self.senders {
-            let _ = tx.take().map(|tx| tx.send(Ok(((), self.cleaner.clone()))));
+            let _ = tx.take().map(|tx| tx.send(Some(())));
         }
     }
 }
 
-impl<Key: Eq + Hash + Clone, Item, T> Drop for Batch<Key, Item, T> {
+impl<Key: Eq + Hash, Item, T> Drop for Batch<Key, Item, T> {
     fn drop(&mut self) {
-        self.notify_all_failed(); // handle senders before dropping guard
-        self.guard.take(); // drop before cleaner
-    }
-}
-
-/// Handle that will try to clean up uncontended leftover batch state on drop.
-struct Cleaner<Key: Eq + Hash, Item, T> {
-    queue: Arc<DashMap<Key, BatchState<Key, Item, T>>>,
-    key: Option<Key>,
-}
-
-impl<Key: Eq + Hash + Clone, Item, T> Clone for Cleaner<Key, Item, T> {
-    fn clone(&self) -> Self {
-        Self {
-            queue: Arc::clone(&self.queue),
-            key: self.key.clone(),
-        }
-    }
-}
-
-impl<Key: Eq + Hash, Item, T> Drop for Cleaner<Key, Item, T> {
-    fn drop(&mut self) {
+        self.notify_all_failed();
         // try to cleanup leftover states if possible
         if let Some(key) = self.key.take() {
-            if let Entry::Occupied(entry) = self.queue.entry(key) {
+            let mut shard = self.queue.get_shard(&key).lock().unwrap();
+            if let Entry::Occupied(entry) = shard.entry(key) {
                 if Arc::strong_count(&entry.get().lock) == 1 {
                     entry.remove();
+                } else {
+                    // return the permit
+                    entry.get().lock.add_permits(1);
                 }
             }
         }
+    }
+}
+
+enum WorkPermit<T> {
+    Result(Option<T>),
+    Permit(Option<OwnedSemaphorePermit>, Receiver<T>),
+}
+
+struct WorkPermitSelect<'a, T, Acquire> {
+    inner: Option<(Receiver<T>, Pin<&'a mut Acquire>)>,
+}
+
+impl<'a, T, Acquire> WorkPermitSelect<'a, T, Acquire> {
+    fn new(rx: Receiver<T>, acq: Pin<&'a mut Acquire>) -> Self {
+        Self {
+            inner: Some((rx, acq)),
+        }
+    }
+}
+
+impl<T, Acquire> Future for WorkPermitSelect<'_, T, Acquire>
+where
+    Acquire: Future<Output = Result<OwnedSemaphorePermit, AcquireError>>,
+{
+    type Output = WorkPermit<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (mut a, mut b) = self.inner.take().expect("cannot poll Select twice");
+
+        if let Poll::Ready(val) = Pin::new(&mut a).poll(cx) {
+            return Poll::Ready(WorkPermit::Result(val.ok().flatten()));
+        }
+
+        if let Poll::Ready(val) = b.as_mut().poll(cx) {
+            return Poll::Ready(WorkPermit::Permit(val.ok(), a));
+        }
+
+        self.inner = Some((a, b));
+        Poll::Pending
     }
 }
