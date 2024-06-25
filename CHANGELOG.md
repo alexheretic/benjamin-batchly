@@ -1,5 +1,5 @@
 # Unreleased
-* Update _dashmap_ to `6`.
+* Update _dashmap_ to `6.0.1`.
 
 # 0.1.1
 * Add `Batch::pull_waiting_items`.
