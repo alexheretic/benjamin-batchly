@@ -1,4 +1,4 @@
-# Unreleased
+# 0.1.2
 * Update _dashmap_ to `6.0.1`.
 
 # 0.1.1
