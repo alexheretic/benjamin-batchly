@@ -230,7 +230,7 @@ async fn handle_convert_to_u32_if_even(
 
             for (idx, item) in items.iter().enumerate() {
                 let n = item.0 as u32;
-                if n % 2 == 0 {
+                if n.is_multiple_of(2) {
                     batch.notify_done(idx, Ok(n));
                 } else {
                     batch.notify_done(idx, Err(NotEven(n)));
